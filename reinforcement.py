@@ -31,6 +31,8 @@ class Net(nn.Module):
 	def __init__(self, **kwargs):
 		super().__init__()
 		self.num_tokens = kwargs.get('num_tokens')
+		self.mem_len = kwargs.get('mem_len')
+		self.cmem_len = kwargs.get('cmem_len')
 		self.online = CompressiveTransformer(**kwargs)
 		self.target = CompressiveTransformer(**kwargs)
 
@@ -45,9 +47,10 @@ class Net(nn.Module):
 		mem, cmem = memories
 
 		num_memory_layers = len(self.online.memory_layers)
-		init_empty_mem = lambda: torch.empty(num_memory_layers, b, 0, d, **to(x))
+		init_empty_mem = lambda: torch.empty(num_memory_layers, b, self.mem_len, d, **to(x))
+		init_empty_cmem = lambda: torch.empty(num_memory_layers, b, self.cmem_len, d, **to(x))
 		mem = default(mem, init_empty_mem)
-		cmem = default(cmem, init_empty_mem)
+		cmem = default(cmem, init_empty_cmem)
 
 		# total_len = mem.shape[2] + cmem.shape[2] + self.online.seq_len
 		# pos_emb = self.online.pos_emb[:, (self.online.seq_len - t):total_len]
@@ -62,7 +65,9 @@ class Net(nn.Module):
 
 		return Memory(mem=mem, compressed_mem=cmem)
 
-	def forward(self, model, inp, cmem = None, reinforce = True):
+	def forward(self, model, inp, cmem = None, reinforce = True, stack=False):
+		if getattr(cmem, 'mem', None) is None:
+			cmem = Memory(*(torch.cat(z, axis=1) for z in zip(*cmem)))
 		if model == "online":
 			out, mem, aux_loss = self.online(inp, cmem)
 		elif model == "target":
@@ -85,17 +90,18 @@ class Policy:
 
 		self.optimizer = torch.optim.Adam(self.net.online.parameters(), lr=0.00025)
 		self.loss_fn = torch.nn.SmoothL1Loss()
-		self.burnin = 1e4  # min. experiences before training
+		self.burnin = 1000  # min. experiences before training
 		self.learn_every = 3  # no. of experiences between updates to Q_online
 		self.sync_every = 1e4  # no. of experiences between Q_target & Q_online sync
 		self.use_cuda = use_cuda
 		self.curr_step = 0
 
 	def act(self, inp, cmem):
-		if np.random.rand() < self.exploration_rate:
-			action, mem = np.random.randint(0, self.net.num_tokens), None
-		else:
-			with torch.no_grad():
+		inp = torch.from_numpy(np.array([[0] * (self.net.target.seq_len - len(inp)) + list(inp)]))
+		with torch.no_grad():
+			if np.random.rand() < self.exploration_rate:
+				action, mem = np.random.randint(0, self.net.num_tokens), self.net('target', inp, cmem)[1]
+			else:
 				logits, mem, _ = self.net('target', inp, cmem)
 				filtered_logits = top_k(logits, thres = 0.8)
 				action = torch.multinomial(F.softmax(filtered_logits, dim=-1), 1)
@@ -129,29 +135,29 @@ class Policy:
 		state, next_state, action, reward, done = zip(*batch)
 		return state, next_state, action, reward, done
 
-	def td_estimate(self, state, action):
+	def td_estimate(self, state, action, stack=False):
 		states, mems = zip(*state)
 		max_state_len = max(len(s) for s in states)
 		states = torch.from_numpy(np.array([[0] * (max_state_len - len(s)) + list(s) for s in states]))
-		mems = self.net.empty_mem(states)
-		logits, mem, aux_loss = self.net("online", states, mems)
+		# mems = self.net.empty_mem(states)
+		logits, mem, aux_loss = self.net("online", states, mems, stack=stack)
 		current_Q = logits[
 			np.arange(0, self.batch_size), -1, action
 		]  # Q_online(s,a)
 		return current_Q, aux_loss
 
 	@torch.no_grad()
-	def td_target(self, reward, next_state, done):
+	def td_target(self, reward, next_state, done, stack=False):
 		states, mems = zip(*next_state)
 		max_state_len = max(len(s) for s in states)
 		states = torch.from_numpy(np.array([[0] * (max_state_len - len(s)) + list(s) for s in states]))
-		mems = self.net.empty_mem(states)
-		next_state_Q = self.net("online", states, mems)[0][:, -1]
+		# mems = self.net.empty_mem(states)
+		next_state_Q = self.net("online", states, mems, stack=stack)[0][:, -1]
 		best_action = torch.argmax(next_state_Q, axis=1)
 		next_Q = self.net("target", states, mems)[0][
 			np.arange(0, self.batch_size), -1, best_action
 		]
-		return (reward + (1 - done) * self.gamma * next_Q).float()
+		return (torch.from_numpy(np.array(reward)) + (1 - torch.from_numpy(np.array(done).astype(int))) * self.gamma * next_Q).float()
 
 	def update_Q_online(self, td_estimate, td_target, aux_loss):
 		loss = self.loss_fn(td_estimate, td_target) + aux_loss
@@ -174,8 +180,8 @@ class Policy:
 		print(f"MarioNet saved to {save_path} at step {self.curr_step}")
 	
 	def learn(self):
-		if self.curr_step % self.sync_every == 0:
-			self.sync_Q_target()
+		# if self.curr_step % self.sync_every == 0:
+		# 	self.sync_Q_target()
 
 		# if self.curr_step % self.save_every == 0:
 		# 	self.save()
@@ -183,17 +189,17 @@ class Policy:
 		if self.curr_step < self.burnin:
 			return None, None
 
-		if self.curr_step % self.learn_every != 0:
-			return None, None
+		# if self.curr_step % self.learn_every != 0:
+		# 	return None, None
 
 		# Sample from memory
 		state, next_state, action, reward, done = self.recall()
 
 		# Get TD Estimate
-		td_est, aux_loss = self.td_estimate(state, action)
+		td_est, aux_loss = self.td_estimate(state, action, stack=True)
 
 		# Get TD Target
-		td_tgt = self.td_target(reward, next_state, done)
+		td_tgt = self.td_target(reward, next_state, done, stack=True)
 
 		# Backpropagate loss through Q_online
 		loss = self.update_Q_online(td_est, td_tgt, aux_loss)
@@ -249,14 +255,14 @@ def loop():
 		cmem_ratio=5,
 	))
 	
-	env = Environment(reward_func=lambda state: sum(state), done_func=lambda state: sum(state) == 10)
+	env = Environment(reward_func=lambda state: sum(state), done_func=lambda state: len(state) == 10)
 
 	episodes = 10
 	for e in range(episodes):
 
 		state = env.reset()
 
-		cmem = None
+		cmem = policy.net.empty_mem(torch.zeros((1, policy.net.online.seq_len), dtype=torch.int32))
 		# Play the game!
 		while True:
 
@@ -267,19 +273,16 @@ def loop():
 			state, action, reward, next_state, done = env.step(action)
 
 			# Remember
-			policy.cache((state, cmem), (next_state, mem), action, reward, done)
+			policy.cache((state.copy(), cmem), (next_state.copy(), mem), action, reward, done)
 			cmem = mem
+			state = next_state
 
 			policy.curr_step += 1
 			# Learn
 			q, loss = policy.learn()
-			print(q, loss)
+			# print(q, loss)
+			policy.exploration_rate = max(policy.exploration_rate * policy.exploration_rate_decay, policy.exploration_rate_min)
+			# # Check if end of game
+			# if done:
+			# 	break
 
-			# Update state
-			state = next_state
-
-			# Check if end of game
-			if done:
-				break
-
-loop()
